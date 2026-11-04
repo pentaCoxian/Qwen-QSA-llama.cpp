@@ -6,27 +6,39 @@ This fork adds three things to the published QSA engine: memory changes that mak
 
 ## Results
 
-Measured on one RTX 4090 at 262K context, with 255K tokens of input, through [`serve.sh`](deploy/qsa27b-24gb/serve.sh). Weights are GSQ-RCO IQ3_S and the drafter is DFlash2 IQ4_XS with 5 drafts. "Before" is this engine without the speed changes, on the same four tasks.
+Measured on one RTX 4090 at 262K context, with the settings in [`serve.sh`](deploy/qsa27b-24gb/serve.sh). Weights are GSQ-RCO IQ3_S and the drafter is DFlash2 IQ4_XS. The default is 4 drafts, but the rows marked below were measured at 5, before that default changed. "Before" is this engine without the speed changes, on the same four tasks.
 
-| | Before | After |
+| Harmonic mean of 4 tasks | Before | After |
 |---|---:|---:|
-| Greedy decode, harmonic mean of 4 tasks | 103.2 tok/s | 118.0 tok/s |
-| Sampled decode, at 60K input, 5 seeds | 97.8 tok/s | 114.8 tok/s |
-| Cold prefill | 2,041 tok/s (125 s) | 2,377 tok/s (107 s) |
-| Peak VRAM | 23.16 GiB | 22.94 GiB |
+| Sampled decode, 60K input, 10 seeds | 97.8 tok/s | 118.8 tok/s |
+| Greedy decode, 60K input | 115.0 tok/s | 132.0 tok/s |
+| Greedy decode, 255K input, 5 drafts | 103.2 tok/s | 118.0 tok/s |
+| Cold prefill, 255K input | 2,041 tok/s (125 s) | 2,377 tok/s (107 s) |
+| Peak VRAM, 255K input, 5 drafts | 23.16 GiB | 22.94 GiB |
 
-Sampled means temperature 1.0, top-p 0.95, top-k 20. Use the sampled row to judge the decode gain: both sides accept drafts at about the same rate there, while the greedy gain is partly different text accepting more drafts.
+Sampled means temperature 1.0, top-p 0.95, top-k 20. It averages over seeds, so it is the fairer decode comparison. Greedy runs one fixed text per build, and its speed moves with how well drafts match that text.
+
+Draft count at 60K, where sampled figures leave out outputs that stopped early:
+
+| Drafts | Sampled | Greedy | VRAM against 5 drafts |
+|---:|---:|---:|---:|
+| 3 | 115.4 tok/s | 120.2 tok/s | −298 MiB |
+| **4** | 118.8 tok/s | 132.0 tok/s | −148 MiB |
+| 5 | 115.0 tok/s | 130.4 tok/s | |
+| 6 | 118.6 tok/s | 132.5 tok/s | +150 MiB |
+
+The gaps between 4, 5 and 6 are close to sampling noise. Set `QSA_DRAFTS` to pick another count.
 
 Speed depends on the task, because code accepts far more drafts than prose:
 
-| Task, greedy at 255K | tok/s | Draft acceptance |
+| Task, greedy at 255K, 5 drafts | tok/s | Draft acceptance |
 |---|---:|---:|
 | `sse_collector` (code) | 169.1 | 0.679 |
 | `collector_tests` (code) | 155.9 | 0.609 |
 | `english_peer_review` (prose) | 96.6 | 0.301 |
 | `japanese_editorial` (prose) | 89.2 | 0.264 |
 
-Quality at 255K, on the same machine:
+Quality at 255K, on the same machine, at 5 drafts:
 
 | Check | Result |
 |---|---|
@@ -39,40 +51,33 @@ The recall set is 40 questions, so treat it as a smoke test.
 
 ## Quick start
 
-You need the NVIDIA driver, the CUDA toolkit, CMake and the `hf` command. The commands below are for RTX 40-series cards. Other cards need a different `CMAKE_CUDA_ARCHITECTURES` and are untested.
-
-Build:
+You need the NVIDIA driver, the CUDA toolkit, CMake and the `hf` command. The build below is for RTX 40-series cards. Other cards need a different `CMAKE_CUDA_ARCHITECTURES` and are untested.
 
 ```sh
 cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CUDA_COMPILER=$(which nvcc) -DCMAKE_CUDA_ARCHITECTURES=89 -DLLAMA_BUILD_UI=OFF
-cmake --build build --target llama-server llama-quantize --parallel
+cmake --build build --target llama-server --parallel
+
+hf download pentacoxian-dev/Qwen3.8-27B-QSA-GSQ-RCO-GGUF --local-dir models   # about 14.3 GB
+deploy/qsa27b-24gb/serve.sh
 ```
 
-Get the models. This downloads about 17 GB and needs about 31 GB of disk once the files below are built:
+Nothing else can share the GPU, and the server listens on `127.0.0.1:8091`. The script's header lists its options, including a lower-memory MTP drafter (about 21.9 GiB, 99.7 tok/s greedy at 255K).
+
+### Making the model files yourself
+
+The [model repo](https://huggingface.co/pentacoxian-dev/Qwen3.8-27B-QSA-GSQ-RCO-GGUF) holds the result of these steps. They need `llama-quantize` built as well, a 17 GB download and about 31 GB of disk:
 
 ```sh
 hf download ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf --local-dir models
 hf download higa2515/Qwen3.8-27B-QSA-BF16 qsa-indexers.safetensors --revision d61281f4626729e4cf138476a704c7fedc08f891 --local-dir models
 hf download higa2515/Qwen3.8-27B-QSA-GGUF mmproj-Qwen3.8-27B-QSA-F16.gguf --local-dir models
 hf download z-lab/Qwen3.8-27B-DFlash2-GGUF Qwen3.8-27B-DFlash2-BF16.gguf --local-dir models
-```
 
-Add the QSA indexers to the GSQ-RCO weights, and build the drafter:
-
-```sh
 python3 deploy/qsa27b-24gb/gguf_qsa_graft.py models/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
   models/qsa-indexers.safetensors models/Qwen3.8-27B-QSA-GSQ-RCO-IQ3_S-mtp.gguf
 build/bin/llama-quantize models/Qwen3.8-27B-DFlash2-BF16.gguf models/Qwen3.8-27B-DFlash2-IQ4_XS.gguf IQ4_XS
 ```
-
-Run it. Nothing else can share the GPU, and the server listens on `127.0.0.1:8091`:
-
-```sh
-deploy/qsa27b-24gb/serve.sh
-```
-
-The script's header lists its options, including a lower-memory MTP drafter (about 21.9 GiB, 99.7 tok/s greedy at 255K).
 
 ## What changed
 
@@ -99,6 +104,7 @@ Upstream's tensor-core DeltaNet kernel only writes the newest rollback snapshot.
 - **State saving:** `LLAMA_QSA_RAW_RING` makes full-state save and restore throw, so `serve.sh` sets `--cache-ram 0` and a prompt cache is not available.
 - **Editing after an image:** normal chat turns reprocess under 20 tokens, but editing a question right after an image reprocesses the whole prompt, about 110 s at 255K.
 - **Output:** text is not bit-identical to builds without the speed changes, because rounding differs. About 1% of tokens pick a different top token. Runs of one build repeat exactly when the seed is fixed.
+- **Early stops:** at temperature 1.0 the model occasionally ends at once, for example `No response requested.` after 5 tokens. It happens with and without rejection sampling.
 - **Rejection sampling:** token distributions were compared over 1,500 samples on each of two prompts, with and without the drafter, and showed no detectable bias. A small bias could still escape a test of that size.
 - **Packed MoE:** `GGML_CUDA_MMQ_MOE_PACK=1` is silently ignored in this build. It matters on V100, so use [Qwen-V100-llama.cpp](https://github.com/pentaCoxian/Qwen-V100-llama.cpp) for V100 cards.
 - **Not tested:** video, images larger than 3200x1800, task benchmarks such as GSM8K, and sparse against dense KL at long context.
