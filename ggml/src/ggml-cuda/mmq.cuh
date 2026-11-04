@@ -990,6 +990,7 @@ static __global__ void mul_mat_q(
     }
     __syncthreads();
 
+#ifdef GGML_CUDA_MMQ_MOE_PACK_BUILD
     // [mmq-moe-pack] packed MoE grid: blockIdx.y indexes the used column tiles of all experts (tile_start = exclusive prefix sum of the
     // per-expert tile counts, from mmq_moe_tile_start), so no block is launched for a tile past an expert's last row
     if (tile_start) {
@@ -1047,6 +1048,8 @@ static __global__ void mul_mat_q(
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
     }
+
+#endif // GGML_CUDA_MMQ_MOE_PACK_BUILD
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
@@ -1450,6 +1453,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+#ifdef GGML_CUDA_MMQ_MOE_PACK_BUILD
 // [mmq-moe-pack] GGML_CUDA_MMQ_MOE_PACK=1, see patch-mt-moepack.py
 static bool ggml_cuda_mmq_moe_pack() {
     static const bool enabled = [] {
@@ -1482,6 +1486,8 @@ static __global__ void mmq_moe_tile_start(const int32_t * __restrict__ expert_bo
         tile_start[0] = 0;
     }
 }
+
+#endif // GGML_CUDA_MMQ_MOE_PACK_BUILD
 
 template <ggml_type type, int J, bool fallback>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -1517,6 +1523,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+#ifdef GGML_CUDA_MMQ_MOE_PACK_BUILD
     // [mmq-moe-pack] launch only the used column tiles (bound: one partial tile per expert plus the full ones)
     if (args.ids_dst && ggml_cuda_mmq_moe_pack() && args.nchannels_y <= 1024 && args.nsamples_y == 1) {
         const int n_experts = args.nchannels_y;
@@ -1536,6 +1543,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
             return;
         }
     }
+
+#endif // GGML_CUDA_MMQ_MOE_PACK_BUILD
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>

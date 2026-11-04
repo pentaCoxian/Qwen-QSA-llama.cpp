@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "mmf.cuh" // [mmvf-batch]
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -1017,6 +1018,12 @@ void ggml_cuda_op_mul_mat_vec_f(
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
 }
 
+// [mmvf-batch] from upstream: mul_mat_f needs full row tiles, for other row counts mul_mat_vec_f still beats cuBLAS at small batch size
+static bool ggml_cuda_mmvf_batch(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
+    static const bool off = getenv("GGML_CUDA_NO_MMVF_BATCH") != nullptr;
+    return !off && !ggml_cuda_should_use_mmf(type, cc, ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, src0_ne, src0_nb, ne11, /*mul_mat_id =*/ false);
+}
+
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11) {
     if (src0_ne[0] % 2 != 0) {
         return false;
@@ -1055,6 +1062,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                if (src0_small && ggml_cuda_mmvf_batch(type, cc, src0_ne, src0_nb, ne11)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
@@ -1081,6 +1091,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+                if (src0_small && ggml_cuda_mmvf_batch(type, cc, src0_ne, src0_nb, ne11)) {
+                    return ne11 <= MMVF_MAX_BATCH_SIZE;
+                }
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;
                 }
