@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <random> // [dflash2-q]
 #include <cstdlib>
 #include <cassert>
 #include <cmath>
@@ -1000,6 +1001,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    // [dflash2-q] probabilistic drafting: a random stream per sequence, independent of the target's, reseeded for each generation so a
+    // fixed seed repeats. LLAMA_DFLASH_Q_TEMP scales the draft temperature against the target's (default 1).
+    std::vector<std::mt19937> q_rng;
+    std::vector<char>         q_reseed;
+    float                     q_temp_scale = 1.0f;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1051,6 +1058,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+
+        q_rng.resize(n_seq);
+        q_reseed.assign(n_seq, 1);
+        if (const char * e = std::getenv("LLAMA_DFLASH_Q_TEMP")) { // [dflash2-q]
+            q_temp_scale = std::max(0.01f, (float) std::atof(e));
+        }
 
         if (is_dspark && this->params.p_min > 0.0f) {
             char buf[16] = {};
@@ -1144,6 +1157,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        q_reseed[seq_id] = 1; // [dflash2-q]
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1308,10 +1323,52 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // [dflash2-q] with result_q set, sample from the scores instead of taking their argmax: the verifier then accepts by
+                // rejection sampling, which keeps the target distribution and accepts more often than matching an argmax draft
+                const bool sample_q = dp.result_q != nullptr && dp.temp > 0.0f;
+                if (sample_q && q_reseed[seq_id]) {
+                    q_rng[seq_id].seed(dp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : dp.seed ^ 0x85ebca6bu);
+                    q_reseed[seq_id] = 0;
+                }
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+
+                    if (sample_q) {
+                        const float t     = dp.temp * q_temp_scale;
+                        const float s_max = *std::max_element(scores, scores + selector_top_k);
+                        std::vector<llama_token_data> cand;
+                        cand.reserve(selector_top_k);
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            const float w = std::exp((scores[k] - s_max) / t);
+                            cand.push_back({ (llama_token) row[k], scores[k] / t, w });
+                            sum += w;
+                        }
+                        // same gate as the argmax path: the most likely candidate must clear p_min
+                        if (params.p_min > 0.0f && 1.0f / sum < params.p_min) {
+                            break;
+                        }
+                        std::uniform_real_distribution<float> uni(0.0f, sum);
+                        float u = uni(q_rng[seq_id]);
+                        int32_t chosen = selector_top_k - 1;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            u -= cand[k].p;
+                            if (u <= 0.0f) {
+                                chosen = k;
+                                break;
+                            }
+                        }
+                        for (auto & e : cand) {
+                            e.p /= sum;
+                        }
+                        predecessor = chosen;
+                        result.push_back(cand[chosen].id);
+                        dp.result_q->push_back(std::move(cand));
+                        continue;
+                    }
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
@@ -1330,6 +1387,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    if (dp.result_q) { // [dflash2-q]
+                        dp.result_q->clear();
+                    }
                 }
                 continue;
             }
