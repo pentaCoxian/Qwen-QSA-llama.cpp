@@ -142,7 +142,7 @@ Upstream's tensor-core DeltaNet kernel only writes the newest rollback snapshot.
 
 From a clean build with GPUs hidden, 60 of 61 of llama.cpp's tests pass. `test-jinja-py` fails only because the test machine has no `jinja2` Python module. The rollback and save-load tests also pass on the RTX 4090. They use tiny models, so the real model checked the tensor-core kernel instead: editing the last 1, 2, 3 or 5 tokens after a prefill matched a cold run on every token.
 
-The quick start above was run as written from the published model files, except that the build step was a test build with the same architecture and compiler. Its results are the ones in the quality table.
+The quick start above was run as written from the published model files, except that the build step was a test build with the same architecture and compiler. The recall, vision and chat results above come from that run.
 
 ## Where this comes from
 
