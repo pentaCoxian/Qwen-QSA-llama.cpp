@@ -1223,7 +1223,9 @@ public:
         for (int64_t k = 0; k < nbt; ++k) {
             const int64_t b  = b0 + k;
             const bool    ok = b <= b1;
-            src[k] = ok ? (int32_t) b : 0;
+            // [qsa-raw-ring] raw keys of block b live at row b % (rows/r) of the ring
+            const int64_t ring = llama_kv_cache_raw_ring_rows();
+            src[k] = ok ? (int32_t) (ring ? b % (ring/r) : b) : 0;
             dst[k] = ok ? (int32_t) b : scratch;
             // a pooled key is rotated to the position of its first token: b*r for text, (t, y, x) for an image
             int32_t sec_pos[4] = { 0, 0, 0, 0 };
@@ -1330,7 +1332,7 @@ llm_graph_input_qsa_blk * llm_build_qsa_base::get_qsa_blk_input(
 
     // [qsa-reserve-blk] a reserve graph (no ubatch placed) sizes the worst re-pool: every block of a full cache
     const bool rsv = !mctx_hyb->get_attn()->has_ubatch();
-    auto inp = std::make_unique<llm_graph_input_qsa_blk>(mctx_hyb, cparams, model.hparams, ratio, fast, rsv || mctx_hyb->blk_rebuild(), model.arch == LLM_ARCH_QWEN35); // [v4bits] [blk-rebuild]
+    auto inp = std::make_unique<llm_graph_input_qsa_blk>(mctx_hyb, cparams, model.hparams, ratio, fast, (rsv && llama_kv_cache_raw_ring_rows() == 0) || mctx_hyb->blk_rebuild(), model.arch == LLM_ARCH_QWEN35); // [qsa-raw-ring] no rebuild, so no worst-case reserve // [v4bits] [blk-rebuild]
 
     // [blk-rebuild] blk_ok() holds here, so the ubatch has a first cell
     const int64_t c0r = rsv ? std::max<int64_t>(0, (int64_t) mctx_hyb->get_idx()->get_n_kv() - n_tokens)
@@ -1381,7 +1383,8 @@ ggml_tensor * llm_build_qsa_base::build_qsa_blk_update(
     const int64_t n_kv    = mctx_idx->get_n_kv();
 
     ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
-    ggml_tensor * k_blk = ggml_view_2d(ctx0, k_all, idx_dim*r, n_kv/r, r*k_all->nb[2], 0);
+    GGML_UNUSED(n_kv);
+    ggml_tensor * k_blk = ggml_view_2d(ctx0, k_all, idx_dim*r, k_all->ne[2]/r, r*k_all->nb[2], 0); // [qsa-raw-ring] what the view holds
 
     ggml_tensor * members = ggml_get_rows(ctx0, k_blk, inp->touch_src);
     const int64_t nbt = members->ne[1];

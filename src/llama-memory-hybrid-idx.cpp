@@ -22,6 +22,7 @@ static bool qsa_blk_debug() {
 // [blk-rebuild2] unset or 0: off. 2: TEST ONLY negative control, the layout is marked valid again but the stale pooled keys are kept.
 // Any other value: rebuild. Read on every call - only state_read asks, which is rare - so a test can switch modes within one process.
 static int qsa_blk_rebuild_mode() {
+    if (llama_kv_cache_raw_ring_rows() > 0) { return 0; } // [qsa-raw-ring] the raw keys to rebuild from are gone
     const char * e = getenv("LLAMA_QSA_BLK_REBUILD");
     return e ? atoi(e) : 0;
 }
@@ -286,6 +287,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 }
 
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && mem_idx && llama_kv_cache_raw_ring_rows() > 0) {
+        throw std::runtime_error("full state save is not supported with LLAMA_QSA_RAW_RING"); // [qsa-raw-ring]
+    }
     llama_memory_hybrid::state_write(io, seq_id, flags);
 
     // [TAG_HYBRID_IDX_STATE] the indexer section goes last, so it is a pure suffix: an old reader stops early instead of misparsing it
@@ -299,6 +303,9 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
 }
 
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && mem_idx && llama_kv_cache_raw_ring_rows() > 0) {
+        throw std::runtime_error("full state restore is not supported with LLAMA_QSA_RAW_RING"); // [qsa-raw-ring]
+    }
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
 

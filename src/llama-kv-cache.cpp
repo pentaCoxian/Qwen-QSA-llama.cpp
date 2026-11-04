@@ -230,7 +230,15 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        // [qsa-raw-ring] only the indexer cache of the sparse Qwen3.5 path
+        store_rows = 0;
+        if (model.arch == LLM_ARCH_QWEN35 && name_tag && strcmp(name_tag, "idx_") == 0 && n_stream == 1) {
+            const uint32_t ring = llama_kv_cache_raw_ring_rows();
+            if (ring > 0 && ring < kv_size) { store_rows = ring; }
+        }
+        const uint32_t rows_k = store_rows ? store_rows : kv_size;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, rows_k, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
@@ -240,7 +248,7 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, rows_k, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
@@ -702,6 +710,19 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    // [mtp-window] LLAMA_MTP_WINDOW=<cells>: the MTP draft context holds that many cells and drops its oldest positions to make
+    // room. It is the plain cache's user here (the target's caches go through the hybrid memory). Drafts are verified by the
+    // target model, so this can only change acceptance, never what the target decides. Must exceed the batch size.
+    static const bool mtp_window = [] { const char * e = getenv("LLAMA_MTP_WINDOW"); return e && atoi(e) > 0; }();
+    if (mtp_window && n_stream == 1) {
+        // count cells, not positions: an image packs many cells into few positions
+        const int64_t room = (int64_t) get_size() - (int64_t) balloc.get_n_tokens() - 8;
+        while (room > 0 && (int64_t) v_cells[0].get_used() > room && seq_pos_max(0) >= 0) {
+            const llama_pos pmin = seq_pos_min(0);
+            seq_rm(0, pmin, (llama_pos) (pmin + std::max<int64_t>(1, (int64_t) v_cells[0].get_used() - room)));
+        }
+    }
 
     do {
         balloc.split_reset();
@@ -1233,6 +1254,17 @@ std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
     return res;
 }
 
+uint32_t llama_kv_cache_raw_ring_rows() {
+    static const uint32_t rows = [] {
+        const char * env = getenv("LLAMA_QSA_RAW_RING");
+        const int64_t n = env ? atoll(env) : 0;
+        if (n <= 0) { return 0u; }
+        if (n % 4 != 0) { throw std::runtime_error("LLAMA_QSA_RAW_RING must be a multiple of 4"); }
+        return (uint32_t) n;
+    }();
+    return rows;
+}
+
 ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1321,6 +1353,9 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    // [qsa-raw-ring] the view covers what the storage holds
+    if (store_rows) { n_kv = std::min(n_kv, store_rows); }
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
@@ -1533,7 +1568,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            data[s*sinfo.size() + i] = offs + (store_rows ? sinfo.idxs[s][i] % store_rows : sinfo.idxs[s][i]); // [qsa-raw-ring]
         }
     }
 }

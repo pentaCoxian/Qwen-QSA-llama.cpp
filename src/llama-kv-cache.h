@@ -24,6 +24,12 @@ uint32_t llama_kv_plan_eff_take(); // the last planned n_kv, then cleared
 // llama_kv_cache
 //
 
+// [qsa-raw-ring] LLAMA_QSA_RAW_RING=<rows>, a multiple of 4: the QSA raw indexer keys are stored for the most recent <rows> cells
+// only, at cell % rows. The fast path re-pools just the blocks a ubatch touches, so older raw keys are never read. Limits: no
+// full-state save or restore, and truncating more than <rows> cells back into the middle of a block re-pools that one block from
+// stale raw keys, which affects the selection of that block only. 0 or unset: off.
+uint32_t llama_kv_cache_raw_ring_rows();
+
 class llama_kv_cache : public llama_memory_i {
 public:
     struct stream_copy_info {
@@ -163,6 +169,9 @@ public:
     //
 
     uint32_t get_size()     const;
+
+    // [qsa-raw-ring] rows of K storage when smaller than the cell count, else 0. See llama_kv_cache_raw_ring_rows().
+    uint32_t store_rows = 0;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;

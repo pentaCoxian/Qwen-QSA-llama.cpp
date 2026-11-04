@@ -1507,7 +1507,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const llama_token  tok   = batch.token[last];
         const llama_pos    pos   = batch.pos[last];
         const llama_seq_id seq   = batch.seq_id[last][0];
-        if (pos + n_pad >= (llama_pos) llama_n_ctx(params.ctx_dft)) {
+        // [mtp-window] the windowed memory has no end of context: positions keep rising while the oldest cells are evicted
+        static const bool mtp_window = [] { const char * e = getenv("LLAMA_MTP_WINDOW"); return e && atoi(e) > 0; }();
+        if (!mtp_window && pos + n_pad >= (llama_pos) llama_n_ctx(params.ctx_dft)) {
             return -1;
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -3213,6 +3215,10 @@ common_speculative_init_result::common_speculative_init_result(
 
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
+    // [mtp-window] only the MTP draft context: see llama_memory_hybrid_idx::init_batch
+    if (const char * e = getenv("LLAMA_MTP_WINDOW"); e && atoi(e) > 0 && spec_mtp) {
+        cparams.n_ctx = std::min<uint32_t>(cparams.n_ctx, (uint32_t) atoi(e));
+    }
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
