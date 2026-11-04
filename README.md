@@ -6,17 +6,40 @@ This fork adds three things to the published QSA engine: memory changes that mak
 
 ## Results
 
-Measured on one RTX 4090 at 262K context, with the settings in [`serve.sh`](deploy/qsa27b-24gb/serve.sh). Weights are GSQ-RCO IQ3_S and the drafter is DFlash2 IQ4_XS. The default is 4 drafts, but the rows marked below were measured at 5, before that default changed. "Before" is this engine without the speed changes, on the same four tasks.
+Measured on one RTX 4090 at 262K context, with [`serve.sh`](deploy/qsa27b-24gb/serve.sh) and the [published model files](https://huggingface.co/pentacoxian-dev/Qwen3.8-27B-QSA-GSQ-RCO-GGUF). Weights are GSQ-RCO IQ3_S and the drafter is DFlash2 IQ4_XS with 4 drafts. Speeds are the harmonic mean of four real tasks. Sampled means temperature 1.0, top-p 0.95, top-k 20, over 4 seeds.
 
-| Harmonic mean of 4 tasks | Before | After |
+Against stock llama.cpp, with the same weights without QSA, the same prompts and the same drafter:
+
+| | This fork | Stock | Gain |
+|---|---:|---:|---:|
+| Greedy decode, empty context | 140.9 tok/s | 128.3 tok/s | +10% |
+| Greedy decode, 64K input | 132.5 tok/s | 81.8 tok/s | +62% |
+| Greedy decode, 128K input | 123.8 tok/s | 63.7 tok/s | +94% |
+| Greedy decode, 255K input | 114.7 tok/s | 40.6 tok/s | 2.8x |
+| Sampled decode, 255K input | 113.0 tok/s | 35.9 tok/s | 3.1x |
+| Cold prefill, 255K input | 2,375 tok/s (108 s) | 1,345 tok/s (190 s) | +77% |
+
+Stock was measured at 6 depths over 2 sampled seeds, with context sized to each depth and no vision loaded.
+
+Against this engine before the speed changes, at 255K input:
+
+| | Before | After |
 |---|---:|---:|
-| Sampled decode, 60K input, 10 seeds | 97.8 tok/s | 118.8 tok/s |
-| Greedy decode, 60K input | 115.0 tok/s | 132.0 tok/s |
-| Greedy decode, 255K input, 5 drafts | 103.2 tok/s | 118.0 tok/s |
-| Cold prefill, 255K input | 2,041 tok/s (125 s) | 2,377 tok/s (107 s) |
-| Peak VRAM, 255K input, 5 drafts | 23.16 GiB | 22.94 GiB |
+| Sampled decode | 103.2 tok/s | 113.0 tok/s |
+| Greedy decode | 103.2 tok/s | 114.7 tok/s |
+| Cold prefill | 2,041 tok/s (125 s) | 2,375 tok/s (108 s) |
+| Peak VRAM | 23.16 GiB | 22.81 GiB |
 
-Sampled means temperature 1.0, top-p 0.95, top-k 20. It averages over seeds, so it is the fairer decode comparison. Greedy runs one fixed text per build, and its speed moves with how well drafts match that text.
+"Before" used 5 drafts and the Q4_K_M drafter. Greedy runs one fixed text per build and its speed moves with how well drafts match that text, so sampled is the fairer comparison.
+
+Speed depends on the task, because code accepts far more drafts than prose:
+
+| Task, greedy at 255K | tok/s | Draft acceptance | Stock tok/s |
+|---|---:|---:|---:|
+| `sse_collector` (code) | 145.2 | 0.653 | 53.3 |
+| `collector_tests` (code) | 145.6 | 0.654 | 47.5 |
+| `english_peer_review` (prose) | 100.9 | 0.375 | 37.1 |
+| `japanese_editorial` (prose) | 89.2 | 0.305 | 31.4 |
 
 Draft count at 60K, where sampled figures leave out outputs that stopped early:
 
@@ -29,29 +52,35 @@ Draft count at 60K, where sampled figures leave out outputs that stopped early:
 
 The gaps between 4, 5 and 6 are close to sampling noise. Set `QSA_DRAFTS` to pick another count.
 
-Speed depends on the task, because code accepts far more drafts than prose:
-
-| Task, greedy at 255K, 5 drafts | tok/s | Draft acceptance |
-|---|---:|---:|
-| `sse_collector` (code) | 169.1 | 0.679 |
-| `collector_tests` (code) | 155.9 | 0.609 |
-| `english_peer_review` (prose) | 96.6 | 0.301 |
-| `japanese_editorial` (prose) | 89.2 | 0.264 |
-
-Quality at 255K, on the same machine, at 5 drafts:
+Quality at 255K:
 
 | Check | Result |
 |---|---|
 | Fact recall, single fact | 24/24 (dense control 24/24) |
 | Fact recall, two-hop | 11/16 (dense control 12/16) |
 | Vision, image 255K tokens before the question | 14/14 |
+| Chat turns after an image | 18 to 20 tokens reprocessed, 0.3 s |
 | KL divergence from BF16, prose / code, at ubatch 8 | 0.0393 / 0.1520 (0.0394 / 0.1525 before the speed changes) |
 
 The recall set is 40 questions, so treat it as a smoke test.
 
+### RTX 5090
+
+The same files and settings on an RTX 5090, built with `-DCMAKE_CUDA_ARCHITECTURES=120`:
+
+| 4 drafts, 262K context | RTX 4090 | RTX 5090 |
+|---|---:|---:|
+| Greedy decode, 255K input | 114.7 tok/s | 141.8 tok/s |
+| Sampled decode, 255K input | 113.0 tok/s | 142.4 tok/s |
+| Cold prefill, 255K input | 2,375 tok/s (108 s) | 2,756 tok/s (93 s) |
+| Fact recall, single / two-hop | 24/24, 11/16 | 24/24, 11/16 |
+| Vision | 14/14 | 14/14 |
+
+The 5090 run sat at its 600 W power limit in about 90% of samples and peaked at 24.0 GB of VRAM, including about 0.45 GB for a desktop.
+
 ## Quick start
 
-You need the NVIDIA driver, the CUDA toolkit, CMake and the `hf` command. The build below is for RTX 40-series cards. Other cards need a different `CMAKE_CUDA_ARCHITECTURES` and are untested.
+You need the NVIDIA driver, the CUDA toolkit, CMake and the `hf` command. The build below is for RTX 40-series cards. For an RTX 5090, use `-DCMAKE_CUDA_ARCHITECTURES=120`. Other cards are untested.
 
 ```sh
 cmake -S . -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
@@ -100,18 +129,20 @@ Upstream's tensor-core DeltaNet kernel only writes the newest rollback snapshot.
 
 ## Limits
 
-- **Hardware:** tested on one RTX 4090 with this one model. Nothing else has been run.
+- **Hardware:** tested with this one model on one RTX 4090 and one RTX 5090, one at a time. Nothing else has been run.
 - **State saving:** `LLAMA_QSA_RAW_RING` makes full-state save and restore throw, so `serve.sh` sets `--cache-ram 0` and a prompt cache is not available.
 - **Editing after an image:** normal chat turns reprocess under 20 tokens, but editing a question right after an image reprocesses the whole prompt, about 110 s at 255K.
 - **Output:** text is not bit-identical to builds without the speed changes, because rounding differs. About 1% of tokens pick a different top token. Runs of one build repeat exactly when the seed is fixed.
-- **Early stops:** at temperature 1.0 the model occasionally ends at once, for example `No response requested.` after 5 tokens. It happens with and without rejection sampling.
+- **Early stops:** at temperature 1.0 on `sse_collector` with 60K of code as context, about 7% of replies end within 16 tokens, usually `No response requested.` The rate is the same with no drafter (28 of 400) and with rejection sampling (27 of 400). The cause isn't known: only this setup has been tested, so it could be the base model, the quantization or QSA.
 - **Rejection sampling:** token distributions were compared over 1,500 samples on each of two prompts, with and without the drafter, and showed no detectable bias. A small bias could still escape a test of that size.
 - **Packed MoE:** `GGML_CUDA_MMQ_MOE_PACK=1` is silently ignored in this build. It matters on V100, so use [Qwen-V100-llama.cpp](https://github.com/pentaCoxian/Qwen-V100-llama.cpp) for V100 cards.
 - **Not tested:** video, images larger than 3200x1800, task benchmarks such as GSM8K, and sparse against dense KL at long context.
 
 ## Tests
 
-From a clean build with GPUs hidden, 60 of 61 of llama.cpp's tests pass, including rollback and save-load. `test-jinja-py` fails only because the test machine has no `jinja2` Python module. With GPUs hidden these tests don't run the GPU kernels, which were checked on the real model instead: editing the last 1, 2, 3 or 5 tokens after a prefill matched a cold run on every token.
+From a clean build with GPUs hidden, 60 of 61 of llama.cpp's tests pass. `test-jinja-py` fails only because the test machine has no `jinja2` Python module. The rollback and save-load tests also pass on the RTX 4090. They use tiny models, so the real model checked the tensor-core kernel instead: editing the last 1, 2, 3 or 5 tokens after a prefill matched a cold run on every token.
+
+The quick start above was run as written from the published model files, except that the build step was a test build with the same architecture and compiler. Its results are the ones in the quality table.
 
 ## Where this comes from
 
