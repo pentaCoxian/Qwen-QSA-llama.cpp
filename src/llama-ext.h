@@ -141,6 +141,7 @@ LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int
 
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
+LLAMA_API void llama_set_embeddings_layer_inp_skip(struct llama_context * ctx, bool value); // [spec-tail]
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);

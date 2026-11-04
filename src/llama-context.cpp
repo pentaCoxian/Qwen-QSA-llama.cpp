@@ -3044,6 +3044,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 }
 
 void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    if (embd_layer_inp_skip) { // [spec-tail]
+        return;
+    }
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -5306,6 +5309,10 @@ uint64_t llama_get_embeddings_nextn_call(llama_context * ctx) {
 const float * llama_get_embeddings_nextn_prev(llama_context * ctx, uint64_t call_id) {
     llama_mtp_async_guard(ctx, __func__); // [mtp-async] // [mtp-lag]
     return ctx->get_embeddings_nextn_prev(call_id);
+}
+
+void llama_set_embeddings_layer_inp_skip(llama_context * ctx, bool value) { // [spec-tail]
+    ctx->set_embeddings_layer_inp_skip(value);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

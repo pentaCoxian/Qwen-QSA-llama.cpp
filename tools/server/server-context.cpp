@@ -3800,7 +3800,30 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // [spec-tail] LLAMA_SPEC_PREFILL_TAIL=<tokens>: a drafter with a sliding window has dropped these rows by the time drafting starts,
+    // so do not extract or feed it batches that end further than that from the end of the prompt. Drafts are verified, so this cannot
+    // change the output. Only when every active slot is that far from the end of its prompt.
+    bool spec_prefill_skip() const {
+        static const int spec_tail = [] { const char * e = std::getenv("LLAMA_SPEC_PREFILL_TAIL"); return e ? std::atoi(e) : 0; }();
+        if (spec_tail <= 0 || !spec) {
+            return false;
+        }
+        for (const auto & s : slots) {
+            if (s.state == SLOT_STATE_IDLE) {
+                continue;
+            }
+            if (s.state != SLOT_STATE_PROCESSING_PROMPT || (int64_t) s.task->n_tokens() - (int64_t) s.prompt.n_tokens() < spec_tail) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+        const bool spec_skip = spec_prefill_skip(); // [spec-tail]
+        if (spec) {
+            llama_set_embeddings_layer_inp_skip(ctx_tgt, spec_skip);
+        }
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         metrics_pre_decode();
@@ -3934,10 +3957,12 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            if (!spec_skip) { // [spec-tail]
             queue_tasks.yield_to_queue([&]() {
                 spec_phase_scope spec_scope_process(2);
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

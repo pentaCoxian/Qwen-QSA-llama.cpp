@@ -128,6 +128,8 @@ struct llama_context {
     uint64_t      get_embeddings_nextn_call() const; // [mtp-lag]
     const float * get_embeddings_nextn_prev(uint64_t call_id); // [mtp-lag]
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_skip(bool skip) { embd_layer_inp_skip = skip; } // [spec-tail] skip the copy to the host; the graph is unchanged
+    bool embd_layer_inp_skip = false;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_qsa_enabled(bool value);
