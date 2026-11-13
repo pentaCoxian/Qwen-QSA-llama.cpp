@@ -3352,6 +3352,15 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline2(device, device->pipeline_topk_radix_qsa, "topk_radix_qsa", topk_radix_select_f32_len, topk_radix_select_f32_data, "main", 5, sizeof(vk_op_topk_radix_push_constants), {BLOCK_SIZE, 1, 1}, {BLOCK_SIZE, 1}, 1, true);
     }
 
+    // [vk-qsa-blk] block-sparse QSA attention: one full subgroup per (split, kv head, token)
+    if (device->subgroup_arithmetic && device->subgroup_require_full_support &&
+        (device->subgroup_size == 64 || device->subgroup_size == 32) && getenv("GGML_VK_QSA_BLOCK_DISABLE") == nullptr) {
+        for (uint32_t gqa : { 1u, 2u, 3u, 4u, 6u, 8u }) {
+            ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_attn[gqa], "qsa_block_attn_" + std::to_string(gqa), qsa_block_attn_len, qsa_block_attn_data, "main", 7, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, gqa, 0}, 1, true, true, device->subgroup_size);
+        }
+        ggml_vk_create_pipeline2(device, device->pipeline_qsa_block_combine, "qsa_block_combine", qsa_block_attn_len, qsa_block_attn_data, "main", 7, sizeof(vk_op_qsa_block_attn_push_constants), {1, 1, 1}, {device->subgroup_size, 1, 1}, 1, true, true, device->subgroup_size);
+    }
+
     ggml_vk_create_pipeline(device, device->pipeline_argmax_f32, "argmax_f32", argmax_f32_len, argmax_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_sum_rows_f32, "sum_rows_f32", sum_rows_f32_len, sum_rows_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { device->subgroup_size }, 1);
@@ -11170,6 +11179,130 @@ void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
     ctx->prealloc_x_need_sync = true;
 }
 
+// [vk-qsa-blk] Block-sparse QSA attention, the counterpart of ggml-cuda/qsa-attn.cu: a FLASH_ATTN_EXT node
+// with src[5] = block ids. See vulkan-shaders/qsa_block_attn.comp for the layout.
+bool ggml_vk_qsa_block_attn_is_sparse(const ggml_tensor * dst) {
+    return dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[5] != nullptr && dst->src[5]->type == GGML_TYPE_I32;
+}
+
+static int ggml_vk_qsa_kv_type(ggml_type t) {
+    switch (t) {
+        case GGML_TYPE_F16:  return 0;
+        case GGML_TYPE_Q8_0: return 1;
+        case GGML_TYPE_Q4_0: return 2;
+        default:             return -1;
+    }
+}
+
+bool ggml_vk_qsa_block_attn_supported(const vk_device& device, const ggml_tensor * dst) {
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * m   = dst->src[3];
+    const ggml_tensor * ids = dst->src[5];
+    if (q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !m || m->type != GGML_TYPE_F16 || dst->src[4] != nullptr ||
+        ggml_vk_qsa_kv_type(k->type) < 0 || ggml_vk_qsa_kv_type(v->type) < 0) {
+        return false;
+    }
+    if (q->ne[0] != 256 || k->ne[0] != 256 || v->ne[0] != 256 || ggml_get_op_params_i32(dst, 6) != 4 ||
+        q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1 || k->ne[1] != v->ne[1] || k->ne[2] != v->ne[2]) {
+        return false;
+    }
+    if (q->ne[1] % k->ne[1] != 0) {
+        return false;
+    }
+    const int64_t gqa = q->ne[1] / k->ne[1];
+    if (gqa > 8 || device->pipeline_qsa_block_attn[gqa] == nullptr || device->pipeline_qsa_block_combine == nullptr) {
+        return false;
+    }
+    // the shader addresses the cache in 16-bit units with 32-bit indices
+    for (const ggml_tensor * t : { k, v }) {
+        if (t->nb[0] != ggml_type_size(t->type) || (t->nb[1] % 2) != 0 || (t->nb[2] % 2) != 0 ||
+            ((uint64_t) t->ne[2]*t->nb[2] + (uint64_t) t->ne[1]*t->nb[1]) / 2 > UINT32_MAX / 2) {
+            return false;
+        }
+    }
+    return q->nb[0] == sizeof(float) && (q->nb[1] % sizeof(float)) == 0 && (q->nb[2] % sizeof(float)) == 0 &&
+           ggml_is_contiguous(m) && ggml_is_contiguous(ids) && ggml_is_contiguous(dst) &&
+           ids->ne[1] == q->ne[2] && m->ne[0] == ids->ne[0]*4 && m->ne[1] == 1 && m->ne[2] == 1 && m->ne[3] == q->ne[2] &&
+           dst->ne[0] == 256 && dst->ne[1] == q->ne[1] && dst->ne[2] == q->ne[2];
+}
+
+void ggml_vk_qsa_block_attn(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * m   = dst->src[3];
+    const ggml_tensor * ids = dst->src[5];
+    GGML_ASSERT(ggml_vk_qsa_block_attn_supported(ctx->device, dst));
+
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+
+    const uint32_t n_head = q->ne[1];
+    const uint32_t n_kv   = k->ne[1];
+    const uint32_t n_tok  = q->ne[2];
+    const uint32_t gqa    = n_head / n_kv;
+    const uint32_t n_wblk = ids->ne[0];
+
+    // enough waves to fill the GPU: small batches split each query's block list
+    static const uint32_t target_waves = [] {
+        const char * e = getenv("GGML_VK_QSA_WAVES");
+        return e ? (uint32_t) std::max(1, atoi(e)) : 1024u;
+    }();
+    static const uint32_t min_blocks = [] {
+        const char * e = getenv("GGML_VK_QSA_MIN_BLOCKS");
+        return e ? (uint32_t) std::max(1, atoi(e)) : 16u;
+    }();
+    uint32_t n_split = std::max(1u, target_waves / (n_tok * n_kv));
+    n_split = std::min({ n_split, std::max(1u, n_wblk / min_blocks), 1024u });
+
+    vk_pipeline pipeline = ctx->device->pipeline_qsa_block_attn[gqa];
+    vk_pipeline combine  = ctx->device->pipeline_qsa_block_combine;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const size_t part_size = n_split > 1 ? (size_t) n_tok * n_head * n_split * (256 + 2) * sizeof(float) : 0;
+    if (n_split > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, combine, 1);
+        if (ctx->prealloc_size_split_k < part_size) {
+            ctx->prealloc_size_split_k = part_size;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+    }
+
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q, true);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k, true);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v, true);
+    vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, m, true);
+    vk_subbuffer i_buf = ggml_vk_tensor_subbuffer(ctx, ids, true);
+    vk_subbuffer o_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
+    vk_subbuffer p_buf = n_split > 1 ? ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0) : o_buf;
+
+    GGML_ASSERT(get_misalign_bytes(ctx, k) % 2 == 0 && get_misalign_bytes(ctx, v) % 2 == 0);
+
+    const vk_op_qsa_block_attn_push_constants pc = {
+        n_head, n_wblk, n_split,
+        (uint32_t) ggml_vk_qsa_kv_type(k->type), (uint32_t) ggml_vk_qsa_kv_type(v->type),
+        get_misalign_bytes(ctx, q) / (uint32_t) sizeof(float), (uint32_t) (q->nb[1] / sizeof(float)), (uint32_t) (q->nb[2] / sizeof(float)),
+        get_misalign_bytes(ctx, k) / 2, (uint32_t) (k->nb[1] / 2), (uint32_t) (k->nb[2] / 2),
+        get_misalign_bytes(ctx, v) / 2, (uint32_t) (v->nb[1] / 2), (uint32_t) (v->nb[2] / 2),
+        get_misalign_bytes(ctx, m) / (uint32_t) sizeof(ggml_fp16_t),
+        get_misalign_bytes(ctx, ids) / (uint32_t) sizeof(int32_t),
+        get_misalign_bytes(ctx, dst) / (uint32_t) sizeof(float),
+        scale,
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf }, pc, { n_split, n_kv, n_tok });
+    if (n_split > 1) {
+        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_dispatch_pipeline(ctx, subctx, combine, { q_buf, k_buf, v_buf, m_buf, i_buf, o_buf, p_buf }, pc, { 1, n_head, n_tok });
+        ctx->prealloc_split_k_need_sync = true;
+    }
+}
+
 void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
     const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
     const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
@@ -12408,7 +12541,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        if (ggml_vk_qsa_block_attn_is_sparse(node)) {
+            ggml_vk_qsa_block_attn(ctx, compute_ctx, node); // [vk-qsa-blk]
+        } else {
+            ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
+        }
 
         break;
 
@@ -15170,6 +15307,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                if (ggml_vk_qsa_block_attn_is_sparse(op)) {
+                    return ggml_vk_qsa_block_attn_supported(device, op); // [vk-qsa-blk]
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];

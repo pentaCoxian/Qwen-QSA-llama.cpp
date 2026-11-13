@@ -1916,8 +1916,10 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         const bool sparse_ok = qwen4exp_qsa_sparse_kernel_enabled() &&
             ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
             (n_tok > 16 || model.arch == LLM_ARCH_QWEN35) &&
-            (k_all->type == GGML_TYPE_Q8_0 || k_all->type == GGML_TYPE_F16) && v_all->type == k_all->type && k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
+            k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
             k_all->ne[3] == 1 && v_all->nb[1] <= v_all->nb[2] && r == 4 && q_cur->type == GGML_TYPE_F32;
+        // [vk-qsa-blk] the cache types the kernel reads are the backend's call: CUDA takes Q8_0/F16 (K and V alike),
+        // Vulkan any mix of F16/Q8_0/Q4_0. The candidate node is built first and the device asked about it.
         if (sparse_ok) {
             // block-sparse kernel: reads each query's blocks straight from the Q8_0 cache
             ggml_tensor * q = ggml_is_contiguous(q_cur) ? q_cur : ggml_cont(ctx0, q_cur);
@@ -1938,12 +1940,20 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
             out->src[2] = v3;
             out->src[3] = selected_mask;
             out->src[5] = ids;
-            cb(out, "kqv_out", il);
-            ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
-            if (inp->self_v_rot) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            if (ggml_backend_dev_supports_op(model.dev_layer(il), out)) {
+                cb(out, "kqv_out", il);
+                ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
+                if (inp->self_v_rot) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+                }
+                return cur;
             }
-            return cur;
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: the block-sparse QSA kernel does not take this K/V cache (%s/%s) on this device; "
+                        "using the slow gather path\n", __func__, ggml_type_name(k_all->type), ggml_type_name(v_all->type));
+            }
         }
     }
 

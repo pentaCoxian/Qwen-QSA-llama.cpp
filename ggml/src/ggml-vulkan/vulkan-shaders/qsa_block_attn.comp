@@ -1,0 +1,268 @@
+#version 450
+
+// Block-sparse attention over a (possibly quantized) K/V cache for QSA: the Vulkan counterpart of
+// ggml-cuda/qsa-attn.cu. Every query attends to its own list of ratio-cell blocks, read straight
+// from the cache, so the cost follows the selected budget and not the context length, and no
+// gathered K/V copy is materialized.
+//
+// A GGML_OP_FLASH_ATTN_EXT node with src[5] = block ids:
+//   q     F32            [D, n_head, n_tok]
+//   k, v  F16/Q8_0/Q4_0  [D, n_head_kv, n_cells]   (cache views; cell = block*R + c)
+//   mask  F16            [n_wblk*R, 1, 1, n_tok]   0 or -inf per selected cell
+//   ids   I32            [n_wblk, n_tok]
+//   dst   F32            [D, n_head, n_tok]
+//
+// One workgroup (a single full subgroup) per (split, kv head, token). Each lane owns D/LANES
+// dims and all GQA query heads of the kv head, so K and V are read once for the whole group;
+// the q.k partial sums are combined with subgroupAdd. With n_split > 1 a query's block list is
+// cut into n_split shares whose partial (max, sum, acc) go to a scratch buffer and are merged by
+// the COMBINE variant, which keeps decode (few queries) from running as a few long serial waves.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(constant_id = 0) const uint LANES   = 64;  // local size == subgroup size
+layout(constant_id = 1) const uint GQA     = 6;   // query heads per kv head
+layout(constant_id = 2) const uint COMBINE = 0;   // 1: merge the per-split partials
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+#define D        256u
+#define R        4u
+#define MAX_GQA  8
+#define MAX_DPL  8
+#define NEG_BIG  (-1.0e30)
+
+#define TYPE_F16  0u
+#define TYPE_Q8_0 1u
+#define TYPE_Q4_0 2u
+
+layout (binding = 0) readonly buffer Q   {float     data_q[];};
+layout (binding = 1) readonly buffer K   {uint16_t  data_k[];};
+layout (binding = 2) readonly buffer V   {uint16_t  data_v[];};
+layout (binding = 3) readonly buffer M   {float16_t data_m[];};
+layout (binding = 4) readonly buffer I   {int       data_i[];};
+layout (binding = 5) writeonly buffer O  {float     data_o[];};
+layout (binding = 6) buffer P            {float     data_p[];};   // per-split partials: [row][D + 2]
+
+layout (push_constant) uniform parameter {
+    uint  n_head;
+    uint  n_wblk;
+    uint  n_split;
+    uint  k_type;
+    uint  v_type;
+    uint  q_offset;   // in floats
+    uint  q_nb1;      // in floats
+    uint  q_nb2;
+    uint  k_offset;   // in uint16
+    uint  k_nb1;      // in uint16: per kv head
+    uint  k_nb2;      // in uint16: per cell
+    uint  v_offset;
+    uint  v_nb1;
+    uint  v_nb2;
+    uint  m_offset;   // in f16
+    uint  i_offset;   // in i32
+    uint  o_offset;   // in floats
+    float scale;
+} p;
+
+float s8(uint b) {
+    return float(int(b << 24) >> 24);
+}
+
+// dims d0 .. d0 + dpl - 1 (dpl in {4, 8}, d0 a multiple of dpl) of one cache row
+#define DEF_LOAD(NAME, BUF)                                                              \
+void NAME(const uint row, const uint type, const uint d0, const uint dpl, out float x[MAX_DPL]) { \
+    if (type == TYPE_F16) {                                                              \
+        for (uint i = 0; i < dpl; i += 2) {                                              \
+            const uint w = uint(BUF[row + d0 + i]) | (uint(BUF[row + d0 + i + 1]) << 16); \
+            const vec2 f = unpackHalf2x16(w);                                            \
+            x[i] = f.x; x[i + 1] = f.y;                                                  \
+        }                                                                                \
+    } else if (type == TYPE_Q8_0) {                                                      \
+        /* block_q8_0: f16 d, int8 qs[32] = 17 uint16 */                                 \
+        const uint b  = row + (d0 / 32) * 17;                                            \
+        const float d = unpackHalf2x16(uint(BUF[b])).x;                                  \
+        const uint o  = b + 1 + (d0 % 32) / 2;                                           \
+        for (uint i = 0; i < dpl; i += 2) {                                              \
+            const uint w = uint(BUF[o + i / 2]);                                         \
+            x[i]     = d * s8(w & 0xFFu);                                                \
+            x[i + 1] = d * s8(w >> 8);                                                   \
+        }                                                                                \
+    } else {                                                                             \
+        /* block_q4_0: f16 d, uint8 qs[16] = 9 uint16; element e: low nibble of byte e for e < 16, else high nibble of byte e - 16 */ \
+        const uint b  = row + (d0 / 32) * 9;                                             \
+        const float d = unpackHalf2x16(uint(BUF[b])).x;                                  \
+        const uint e  = d0 % 32;                                                         \
+        const uint sh = e < 16 ? 0u : 4u;                                                \
+        const uint o  = b + 1 + (e % 16) / 2;                                            \
+        for (uint i = 0; i < dpl; i += 2) {                                              \
+            const uint w = uint(BUF[o + i / 2]);                                         \
+            x[i]     = d * (float((w >> sh) & 0xFu) - 8.0);                              \
+            x[i + 1] = d * (float((w >> (8 + sh)) & 0xFu) - 8.0);                        \
+        }                                                                                \
+    }                                                                                    \
+}
+
+DEF_LOAD(load_k, data_k)
+DEF_LOAD(load_v, data_v)
+
+void attend() {
+    const uint lane  = gl_LocalInvocationID.x;
+    const uint split = gl_WorkGroupID.x;
+    const uint h_kv  = gl_WorkGroupID.y;
+    const uint tok   = gl_WorkGroupID.z;
+    const uint dpl   = D / LANES;
+    const uint d0    = lane * dpl;
+    const uint h0    = h_kv * GQA;
+
+    const uint per = (p.n_wblk + p.n_split - 1) / p.n_split;
+    const uint j0  = split * per;
+    const uint j1  = min(p.n_wblk, j0 + per);
+
+    float qr[MAX_GQA][MAX_DPL];
+    float acc[MAX_GQA][MAX_DPL];
+    float m_run[MAX_GQA];
+    float l_run[MAX_GQA];
+    for (uint h = 0; h < GQA; ++h) {
+        const uint qb = p.q_offset + tok * p.q_nb2 + (h0 + h) * p.q_nb1 + d0;
+        for (uint d = 0; d < dpl; ++d) {
+            qr[h][d]  = data_q[qb + d] * p.scale;
+            acc[h][d] = 0.0;
+        }
+        m_run[h] = NEG_BIG;
+        l_run[h] = 0.0;
+    }
+
+    const uint mb = p.m_offset + tok * p.n_wblk * R;
+    const uint ib = p.i_offset + tok * p.n_wblk;
+
+    for (uint j = j0; j < j1; ++j) {
+        float mv[R];
+        bool any = false;
+        for (uint c = 0; c < R; ++c) {
+            mv[c] = float(data_m[mb + j * R + c]);
+            any = any || mv[c] > -60000.0;
+        }
+        if (!any) {
+            continue; // padding block
+        }
+        const uint cell0 = uint(data_i[ib + j]) * R;
+
+        // q.k for every (head, cell); all lanes agree after subgroupAdd
+        float s[MAX_GQA][R];
+        float vx[R][MAX_DPL];
+        for (uint c = 0; c < R; ++c) {
+            if (mv[c] > -60000.0) {
+                float kx[MAX_DPL];
+                load_k(p.k_offset + (cell0 + c) * p.k_nb2 + h_kv * p.k_nb1, p.k_type, d0, dpl, kx);
+                load_v(p.v_offset + (cell0 + c) * p.v_nb2 + h_kv * p.v_nb1, p.v_type, d0, dpl, vx[c]);
+                for (uint h = 0; h < GQA; ++h) {
+                    float part = 0.0;
+                    for (uint d = 0; d < dpl; ++d) {
+                        part += qr[h][d] * kx[d];
+                    }
+                    s[h][c] = subgroupAdd(part) + mv[c];
+                }
+            } else {
+                for (uint h = 0; h < GQA; ++h) {
+                    s[h][c] = NEG_BIG;
+                }
+                for (uint d = 0; d < dpl; ++d) {
+                    vx[c][d] = 0.0;
+                }
+            }
+        }
+
+        // online softmax per head over the block's cells
+        for (uint h = 0; h < GQA; ++h) {
+            float bmax = s[h][0];
+            for (uint c = 1; c < R; ++c) {
+                bmax = max(bmax, s[h][c]);
+            }
+            const float m_new = max(m_run[h], bmax);
+            const float alpha = exp(m_run[h] - m_new);
+            float psum = 0.0;
+            for (uint d = 0; d < dpl; ++d) {
+                acc[h][d] *= alpha;
+            }
+            for (uint c = 0; c < R; ++c) {
+                const float pc = mv[c] > -60000.0 ? exp(s[h][c] - m_new) : 0.0;
+                psum += pc;
+                for (uint d = 0; d < dpl; ++d) {
+                    acc[h][d] += pc * vx[c][d];
+                }
+            }
+            l_run[h] = l_run[h] * alpha + psum;
+            m_run[h] = m_new;
+        }
+    }
+
+    if (p.n_split == 1) {
+        for (uint h = 0; h < GQA; ++h) {
+            const float inv = l_run[h] > 0.0 ? 1.0 / l_run[h] : 0.0;
+            const uint ob = p.o_offset + (tok * p.n_head + h0 + h) * D + d0;
+            for (uint d = 0; d < dpl; ++d) {
+                data_o[ob + d] = acc[h][d] * inv;
+            }
+        }
+        return;
+    }
+
+    for (uint h = 0; h < GQA; ++h) {
+        const uint row = ((tok * p.n_head + h0 + h) * p.n_split + split) * (D + 2);
+        for (uint d = 0; d < dpl; ++d) {
+            data_p[row + d0 + d] = acc[h][d];
+        }
+        if (lane == 0) {
+            data_p[row + D]     = m_run[h];
+            data_p[row + D + 1] = l_run[h];
+        }
+    }
+}
+
+// one workgroup per (query head, token): merge the n_split partial softmaxes
+void combine() {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint head = gl_WorkGroupID.y;
+    const uint tok  = gl_WorkGroupID.z;
+    const uint dpl  = D / LANES;
+    const uint d0   = lane * dpl;
+    const uint row0 = (tok * p.n_head + head) * p.n_split * (D + 2);
+
+    float m = NEG_BIG;
+    for (uint sp = 0; sp < p.n_split; ++sp) {
+        m = max(m, data_p[row0 + sp * (D + 2) + D]);
+    }
+    float l = 0.0;
+    float acc[MAX_DPL];
+    for (uint d = 0; d < dpl; ++d) {
+        acc[d] = 0.0;
+    }
+    for (uint sp = 0; sp < p.n_split; ++sp) {
+        const uint row = row0 + sp * (D + 2);
+        const float ls = data_p[row + D + 1];
+        if (ls > 0.0) {
+            const float w = exp(data_p[row + D] - m);
+            l += w * ls;
+            for (uint d = 0; d < dpl; ++d) {
+                acc[d] += w * data_p[row + d0 + d];
+            }
+        }
+    }
+    const float inv = l > 0.0 ? 1.0 / l : 0.0;
+    const uint ob = p.o_offset + (tok * p.n_head + head) * D + d0;
+    for (uint d = 0; d < dpl; ++d) {
+        data_o[ob + d] = acc[d] * inv;
+    }
+}
+
+void main() {
+    if (COMBINE != 0) {
+        combine();
+    } else {
+        attend();
+    }
+}
