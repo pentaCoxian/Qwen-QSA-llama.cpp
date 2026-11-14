@@ -1833,6 +1833,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
 // Attend each query to its selected blocks plus its tail block. With cell == position a block
 // is one row of a [ratio cells] view of the K/V cache, so whole blocks are gathered at once.
+// [kv-stream] what changes from one ubatch to the next for a streamed cache (see llama-kv-cache.h)
+class llm_graph_input_kv_stream : public llm_graph_input_i {
+public:
+    llm_graph_input_kv_stream(const llama_kv_cache * kv) : kv(kv) {}
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        const int32_t data[4] = { (int32_t) kv->stream_R, (int32_t) kv->stream_H, (int32_t) kv->stream_end, 0 };
+        ggml_backend_tensor_set(prm, data, 0, sizeof(data));
+    }
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        return cold == (kv->stream_R > kv->stream_P); // the nodes are built with or without the resolve stage
+    }
+    ggml_tensor * prm = nullptr;
+    const llama_kv_cache * kv;
+    bool cold = false;
+};
+
 ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         llm_graph_input_attn_kv * inp,
         llm_graph_input_qsa_blk * blk_inp,
@@ -1916,8 +1934,10 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
         const bool sparse_ok = qwen4exp_qsa_sparse_kernel_enabled() &&
             ggml_backend_dev_type(model.dev_layer(il)) == GGML_BACKEND_DEVICE_TYPE_GPU &&
             (n_tok > 16 || model.arch == LLM_ARCH_QWEN35) &&
-            (k_all->type == GGML_TYPE_Q8_0 || k_all->type == GGML_TYPE_F16) && v_all->type == k_all->type && k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
+            k_all->ne[0] == 256 && v_all->ne[0] == 256 &&
             k_all->ne[3] == 1 && v_all->nb[1] <= v_all->nb[2] && r == 4 && q_cur->type == GGML_TYPE_F32;
+        // [vk-qsa-blk] the cache types the kernel reads are the backend's call: CUDA takes Q8_0/F16 (K and V alike),
+        // Vulkan any mix of F16/Q8_0/Q4_0. The candidate node is built first and the device asked about it.
         if (sparse_ok) {
             // block-sparse kernel: reads each query's blocks straight from the Q8_0 cache
             ggml_tensor * q = ggml_is_contiguous(q_cur) ? q_cur : ggml_cont(ctx0, q_cur);
@@ -1938,13 +1958,56 @@ ggml_tensor * llm_build_qsa_base::build_attn_qsa_blk(
             out->src[2] = v3;
             out->src[3] = selected_mask;
             out->src[5] = ids;
-            cb(out, "kqv_out", il);
-            ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
-            if (inp->self_v_rot) {
-                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            const llama_kv_cache * kv_stream = mctx_cur->get_kv(); // [kv-stream]
+            if (kv_stream && kv_stream->stream_enabled()) {
+                // the backend makes the selected cold blocks resident and rewrites the ids to physical blocks before
+                // it attends (ggml-vulkan: ggml_vk_qsa_block_attn). op_params: [7] 1, [8..9] / [10..11] the host K / V
+                // pointers, [12] prefix cells, [13] ring cells, [14] cache slots, [15] cold blocks
+                if (!kv_stream_prm) {
+                    auto sin = std::make_unique<llm_graph_input_kv_stream>(kv_stream);
+                    sin->prm = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
+                    ggml_set_input(sin->prm);
+                    ggml_set_name(sin->prm, "kv_stream_prm");
+                    sin->cold = kv_stream->stream_R > kv_stream->stream_P;
+                    kv_stream_prm = sin->prm;
+                    res->add_input(std::move(sin));
+                }
+                // 1: every cell is still at its own index (nothing has left the ring), the backend attends directly;
+                // 2: resolve first
+                const int32_t  one = kv_stream->stream_R > kv_stream->stream_P ? 2 : 1;
+                const uint64_t hk  = (uint64_t) (uintptr_t) kv_stream->stream_host_k_ptr(il);
+                const uint64_t hv  = (uint64_t) (uintptr_t) kv_stream->stream_host_v_ptr(il);
+                const int32_t  geo[4] = { (int32_t) kv_stream->stream_P, (int32_t) kv_stream->stream_T,
+                                          (int32_t) kv_stream->stream_slots, (int32_t) kv_stream->stream_cold_blocks() };
+                memcpy((char *) out->op_params +  7*sizeof(int32_t), &one, sizeof(one));
+                memcpy((char *) out->op_params +  8*sizeof(int32_t), &hk,  sizeof(hk));
+                memcpy((char *) out->op_params + 10*sizeof(int32_t), &hv,  sizeof(hv));
+                memcpy((char *) out->op_params + 12*sizeof(int32_t), geo,  sizeof(geo));
+                out->src[6] = kv_stream->stream_map(il);
+                out->src[7] = kv_stream_prm;
             }
-            return cur;
+            if (ggml_backend_dev_supports_op(model.dev_layer(il), out)) {
+                cb(out, "kqv_out", il);
+                ggml_tensor * cur = ggml_reshape_2d(ctx0, out, 256*q->ne[1], n_tok);
+                if (inp->self_v_rot) {
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+                }
+                return cur;
+            }
+            if (kv_stream && kv_stream->stream_enabled()) {
+                GGML_ABORT("[kv-stream] this device or K/V cache type has no block-sparse QSA kernel");
+            }
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LLAMA_LOG_WARN("%s: the block-sparse QSA kernel does not take this K/V cache (%s/%s) on this device; "
+                        "using the slow gather path\n", __func__, ggml_type_name(k_all->type), ggml_type_name(v_all->type));
+            }
         }
+    }
+
+    if (mctx_cur->get_kv() && mctx_cur->get_kv()->stream_enabled() && mctx_cur->get_kv()->stream_R > mctx_cur->get_kv()->stream_P) { // [kv-stream]
+        GGML_ABORT("[kv-stream] the gather path cannot read a streamed K/V cache");
     }
 
     ids = ggml_reshape_1d(ctx0, ids, n_wblk*n_tok);

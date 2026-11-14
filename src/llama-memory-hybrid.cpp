@@ -31,7 +31,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
-    mem_attn(new llama_kv_cache(
+    mem_attn((llama_kv_stream_arm(true), new llama_kv_cache(
         model,
         model.hparams,
         type_k,
@@ -50,7 +50,7 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_attn,
         nullptr,
         nullptr
-    )),
+    ))),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
