@@ -1473,8 +1473,11 @@ void common_speculative_mtp_adaptive::accept(int32_t accepted) {
     if (pending <= 0) { return; }
     const double rate = double(std::max(0, std::min(accepted, pending))) / pending;
     ema = ema < 0.0 ? rate : 0.25*rate + 0.75*ema;
-    if (ema >= 0.70) { depth = 3; }
-    else if (ema < 0.55) { depth = 2; }
+    // LLAMA_MTP_ADAPTIVE_UP / _DOWN: the acceptance averages at which the depth goes to 3 and back to 2
+    static const double up = [] { const char * e = getenv("LLAMA_MTP_ADAPTIVE_UP"); return e ? atof(e) : 0.70; }();
+    static const double down = [] { const char * e = getenv("LLAMA_MTP_ADAPTIVE_DOWN"); return e ? atof(e) : 0.55; }();
+    if (ema >= up) { depth = 3; }
+    else if (ema < down) { depth = 2; }
     pending = 0;
 }
 

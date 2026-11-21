@@ -11984,6 +11984,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // [qsa27b-mmvq] Qwen3.8-27B matvec shapes at the column counts of decode and MTP verify
+    // (TEST_QSA27B_MMVQ=1 runs only these).
+    {
+        const bool only = getenv("TEST_QSA27B_MMVQ") != nullptr;
+        for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q2_K,
+                               GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS}) {
+            for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{17408, 5120}, {5120, 17408}, {10240, 5120}}) {
+                for (int64_t n : {1, 2, 3, 4}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+                }
+            }
+        }
+        if (only) {
+            return test_cases;
+        }
+    }
+
     // [gpu-topk] GPU_TOPK_PERF=1: only the device top-K of logits rows as LLAMA_GPU_TOPK builds it (248,320 vocabulary, 1..4 rows,
     // K 20 / 64 / 256): part 0 the ids (TOP_K) and part 2 the gather of the values (GET_ROWS); the pair = part 0 + part 2
     if (getenv("GPU_TOPK_PERF")) {

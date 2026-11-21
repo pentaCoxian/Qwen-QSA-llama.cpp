@@ -786,7 +786,23 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    // [mtp-draft-rows] LLAMA_MTP_DRAFT_ROWS=K: the draft head scores only the first K token ids (the lowest ids, roughly
+    // the most frequent tokens), through a view of the head's first K rows: no copy and no extra memory. The other ids
+    // get a logit far below the kept ones (the kept logits are lifted by 1e4 and the rest padded with 0), so the draft
+    // never proposes them; the target still verifies every draft, so this changes speed and acceptance only.
+    // After upstream llama.cpp PR 31037, which copies the rows instead.
+    static const int64_t draft_rows = [] {
+        const char * env = getenv("LLAMA_MTP_DRAFT_ROWS");
+        return env ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
+    if (draft_rows > 0 && draft_rows < head_w->ne[1] && head_s == nullptr && ggml_is_contiguous(head_w)) {
+        ggml_tensor * head_v = ggml_view_2d(ctx0, head_w, head_w->ne[0], draft_rows, head_w->nb[1], 0);
+        cur = build_lora_mm(head_v, cur, nullptr);
+        cur = ggml_scale_bias(ctx0, cur, 1.0f, 1.0e4f);
+        cur = ggml_pad(ctx0, cur, (int) (head_w->ne[1] - draft_rows), 0, 0, 0);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

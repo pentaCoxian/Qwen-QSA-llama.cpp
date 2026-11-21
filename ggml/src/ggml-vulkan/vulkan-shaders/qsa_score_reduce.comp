@@ -1,0 +1,42 @@
+#version 450
+
+// QSA indexer block scores, the part after the q.k products: rectify per indexer head, sum the heads, add the
+// visibility bias. One pass in place of RELU, CONT, an ADD per head and the bias chain (REPEAT, SUB, STEP, SCALE,
+// ADD) that llm_build_qsa_base::build_qsa_blk_select otherwise emits, with the same arithmetic in the same order.
+//
+//   score [n_blk, n_head, n_tok]   q.k per indexer head (the MUL_MAT's output)
+//   vis   [n_tok]                  complete blocks each query sees
+//   dst   [n_blk, n_tok]           sum_h max(score, 0), and -1e30 for the blocks a query cannot see
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer S  {float data_s[];};
+layout (binding = 1) readonly buffer V  {float data_v[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint n_blk;
+    uint n_head;
+    uint n_tok;
+    uint s_offset;
+    uint v_offset;
+    uint v_stride;
+    uint d_offset;
+} p;
+
+void main() {
+    const uint b = gl_GlobalInvocationID.x;
+    const uint t = gl_GlobalInvocationID.y;
+    if (b >= p.n_blk || t >= p.n_tok) {
+        return;
+    }
+    const uint base = p.s_offset + b + p.n_blk * p.n_head * t;
+    float sum = max(data_s[base], 0.0);
+    for (uint h = 1; h < p.n_head; ++h) {
+        sum = sum + max(data_s[base + p.n_blk * h], 0.0);
+    }
+    const float vis = data_v[p.v_offset + t * p.v_stride];
+    // the graph's step(-(b - vis) - 0.5) * 1e30 - 1e30
+    const float bias = (vis - float(b) - 0.5) > 0.0 ? 0.0 : -1.0e30;
+    data_d[p.d_offset + b + p.n_blk * t] = sum + bias;
+}

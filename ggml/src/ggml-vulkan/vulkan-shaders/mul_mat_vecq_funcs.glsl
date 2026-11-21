@@ -470,6 +470,65 @@ FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
 }
 #endif
 
+#if defined(DATA_A_IQ3_S) || defined(DATA_A_IQ3_XXS)
+// [iq3-mmvq] four grid values (one byte each, all > 0) with their sign bits applied: int8 x 4 for dotPacked4x8EXT.
+// A set bit negates its byte (~g + 1); the bytes are never 0, so the +1 does not carry into the next byte.
+int32_t iq3_signed(const uint32_t grid, const uint s4) {
+    const uint32_t t = (s4 | (s4 << 7) | (s4 << 14) | (s4 << 21)) & 0x01010101u;
+    return int32_t((grid ^ (t * 0xFFu)) + t);
+}
+#endif
+
+#if defined(DATA_A_IQ3_S)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    const uint qh = data_a[ib].qh[ib32];
+
+    int32_t q_sum = 0;
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const uint qs = uint(data_a_packed16[ib].qs[4 * ib32 + l]);
+        const uint sign = data_a[ib].signs[4 * ib32 + l];
+        const uint32_t g0 = iq3s_grid[(qs & 0xFF) | ((qh << (8 - 2*l)) & 0x100)];
+        const uint32_t g1 = iq3s_grid[(qs >> 8)   | ((qh << (7 - 2*l)) & 0x100)];
+
+        q_sum += dotPacked4x8EXT(iq3_signed(g0, sign & 0xF), cache_b_qs[2 * l]);
+        q_sum += dotPacked4x8EXT(iq3_signed(g1, sign >> 4),  cache_b_qs[2 * l + 1]);
+    }
+
+    const uint scale = (data_a[ib].scales[ib32/2] >> (4 * (ib32 & 1))) & 0xF;
+    const float d = float(data_a[ib].d) * float(1 + 2 * scale);
+
+    return FLOAT_TYPE(float(cache_b_ds.x) * d * float(q_sum));
+}
+#endif
+
+#if defined(DATA_A_IQ3_XXS)
+FLOAT_TYPE mmvq_dot_product(const uint ib_a, const uint iqs) {
+    const uint ib = ib_a / 8;
+    const uint ib32 = ib_a % 8;
+    const uint signscale = pack32(u16vec2(
+        data_a_packed16[ib].qs[QUANT_K / 8 + 2 * ib32],
+        data_a_packed16[ib].qs[QUANT_K / 8 + 2 * ib32 + 1]));
+
+    int32_t q_sum = 0;
+    [[unroll]] for (uint l = 0; l < 4; ++l) {
+        const uint qs = uint(data_a_packed16[ib].qs[4 * ib32 + l]);
+        const uint sign7 = bitfieldExtract(signscale, 7 * int(l), 7);
+        const uint sign = sign7 | ((uint(bitCount(sign7)) & 1u) << 7); // the 8th sign is the parity of the other seven
+        const uint32_t g0 = iq3xxs_grid[qs & 0xFF];
+        const uint32_t g1 = iq3xxs_grid[qs >> 8];
+
+        q_sum += dotPacked4x8EXT(iq3_signed(g0, sign & 0xF), cache_b_qs[2 * l]);
+        q_sum += dotPacked4x8EXT(iq3_signed(g1, sign >> 4),  cache_b_qs[2 * l + 1]);
+    }
+
+    const float d = float(data_a[ib].d) * 0.5 * (0.5 + float(signscale >> 28));
+
+    return FLOAT_TYPE(float(cache_b_ds.x) * d * float(q_sum));
+}
+#endif
+
 #if defined(DATA_A_IQ1_S)
 void repack8(uint ib, uint iqs, out i32vec4 out0, out i32vec4 out1) {
     const uint ib32 = iqs / 32;

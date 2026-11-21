@@ -111,6 +111,7 @@ struct llm_build_qsa_base : public llm_build_delta_net_base {
         // pooled block-key cache (see llama_memory_hybrid_idx::get_mem_blk): inputs per ratio,
         // the incremental update, and the fixed-cost decode selection + attention over whole blocks
         std::map<uint32_t, llm_graph_input_qsa_blk *> qsa_blk_inps;
+        ggml_tensor * kv_stream_prm = nullptr; // [kv-stream] one per graph: [0] the first cell that is intact in the ring
 
         llm_graph_input_qsa_blk * get_qsa_blk_input(
   const llama_memory_hybrid_idx_context * mctx_hyb,

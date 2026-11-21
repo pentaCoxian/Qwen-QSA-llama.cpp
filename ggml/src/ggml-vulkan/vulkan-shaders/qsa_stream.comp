@@ -1,0 +1,191 @@
+#version 450
+
+// K/V streaming for the QSA block-sparse attention (qsa_block_attn.comp), resolved on the device: no readback.
+// After Strata's kv_stream (a residency map with a CLOCK sweep, github.com/Niko1221/Strata), re-done for Vulkan.
+//
+// A streamed layer's K/V tensors hold, in blocks of 4 cells:
+//   [0, p_blocks)                      the first cells, at their own index
+//   [p_blocks, p_blocks + t_blocks)    a ring with the most recent cells
+//   [base, base + n_slots)             cache slots for older ("cold") blocks, whose authoritative copy is host memory
+// The map tensor (I32) is  ctl[16] | page_table[n_cold] | slot_block[S] | slot_stamp[S] | slot_ref[S] | miss_block[S] | miss_slot[S]
+// with page_table[cold block] = slot, or -1.
+//
+// MODE 0, resolve: one workgroup. Every cold block the ids name is made resident and the ids are rewritten to
+//   physical blocks: hits take this call's epoch and their reference bit, misses are claimed once, each miss gets a
+//   victim slot from a clock sweep that never takes a slot this call uses.
+// MODE 1, copy: one workgroup per miss copies the block from the host copy (read over PCIe) into its slot.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint LOCAL = 1024;
+layout(constant_id = 1) const uint MODE  = 0;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) buffer I           {int  ids[];};     // resolve: block ids, rewritten in place
+layout (binding = 1) buffer M           {int  map[];};
+layout (binding = 2) readonly buffer R  {int  prm[];};     // resolve: [0] first cell that is intact in the ring
+layout (binding = 3) readonly buffer H  {uint host[];};    // copy: host K or V, cold blocks from 0
+layout (binding = 4) buffer D           {uint dev[];};     // copy: device K or V
+
+layout (push_constant) uniform parameter {
+    uint n_ids;
+    uint p_blocks;
+    uint t_blocks;
+    uint n_slots;
+    uint n_cold;
+    uint n_blocks;   // blocks of the whole cache: larger ids are padding
+    uint i_offset;   // in i32
+    uint m_offset;   // in i32
+    uint r_offset;   // in i32
+    uint h_offset;   // in u32
+    uint d_offset;   // in u32, of block 0 of the device tensor
+    uint words;      // u32 per block
+} p;
+
+#define CTL_EPOCH    0
+#define CTL_HAND     1
+#define CTL_MISSES   2
+#define CTL_OVERFLOW 3
+#define CTL_TOT_MISS 4
+#define CTL_TOT_CALL 5
+#define CTL_TOT_IDS  6
+
+shared int s_nmiss;
+shared int s_got;
+shared int s_ovf;
+
+void resolve() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint S   = p.n_slots;
+    const uint PT  = p.m_offset + 16;
+    const uint SB  = PT + p.n_cold;
+    const uint SS  = SB + S;
+    const uint SR  = SS + S;
+    const uint MB  = SR + S;
+    const uint MS  = MB + S;
+
+    const int  epoch = map[p.m_offset + CTL_EPOCH] + 1;
+    const int  hand  = map[p.m_offset + CTL_HAND];
+    const uint r_blk = uint(prm[p.r_offset]) / 4u;
+
+    if (tid == 0) { s_nmiss = 0; s_got = 0; s_ovf = 0; }
+    barrier();
+
+    // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
+    for (uint i = tid; i < p.n_ids; i += LOCAL) {
+        const int b = ids[p.i_offset + i];
+        if (b < int(p.p_blocks) || uint(b) >= r_blk || uint(b) >= p.n_blocks) {
+            continue;
+        }
+        const uint cb = uint(b) - p.p_blocks;
+        const int  sl = map[PT + cb];
+        if (sl >= 0) {
+            map[SS + uint(sl)] = epoch;
+            map[SR + uint(sl)] = 1;
+        } else if (sl == -1) {
+            if (atomicCompSwap(map[PT + cb], -1, -2) == -1) {
+                const int k = atomicAdd(s_nmiss, 1);
+                if (uint(k) < S) {
+                    map[MB + uint(k)] = int(cb);
+                }
+            }
+        }
+    }
+    barrier();
+    memoryBarrierBuffer();
+
+    // 2. one victim per miss: a clock sweep from the hand. A slot this call uses is never taken; a referenced one
+    //    loses its bit as the hand passes and can be taken on a later pass.
+    const int need = min(s_nmiss, int(S));
+    uint scanned = 0;
+    while (true) {
+        barrier();
+        memoryBarrierBuffer();
+        if (s_got >= need || scanned >= 3u * S) {
+            break;
+        }
+        if (tid < S) {
+            const uint j = (uint(hand) + scanned + tid) % S;
+            if (map[SS + j] != epoch) {
+                if (map[SB + j] < 0 || map[SR + j] == 0) {
+                    const int k = atomicAdd(s_got, 1);
+                    if (k < need) {
+                        const int cb  = map[MB + uint(k)];
+                        const int old = map[SB + j];
+                        if (old >= 0) {
+                            map[PT + uint(old)] = -1;
+                        }
+                        map[SB + j]        = cb;
+                        map[PT + uint(cb)] = int(j);
+                        map[SS + j]        = epoch;
+                        map[SR + j]        = 1;
+                        map[MS + uint(k)]  = int(j);
+                    }
+                } else {
+                    map[SR + j] = 0;
+                }
+            }
+        }
+        scanned += min(LOCAL, S);
+    }
+    const int got = min(s_got, need);
+
+    // 3. the ids become physical blocks. A block that found no slot (more cold blocks in one call than slots) is
+    //    unclaimed again and counted: the host aborts on that count.
+    const uint base = p.p_blocks + p.t_blocks;
+    for (uint i = tid; i < p.n_ids; i += LOCAL) {
+        const int b = ids[p.i_offset + i];
+        if (b < 0 || uint(b) >= p.n_blocks) {
+            ids[p.i_offset + i] = 0; // padding, never a visible block
+        } else if (b < int(p.p_blocks)) {
+            // resident at its own index
+        } else if (uint(b) >= r_blk) {
+            ids[p.i_offset + i] = int(p.p_blocks + (uint(b) - p.p_blocks) % p.t_blocks);
+        } else {
+            const uint cb = uint(b) - p.p_blocks;
+            const int  sl = map[PT + cb];
+            if (sl >= 0) {
+                ids[p.i_offset + i] = int(base + uint(sl));
+            } else {
+                map[PT + cb] = -1;
+                ids[p.i_offset + i] = 0;
+                atomicAdd(s_ovf, 1);
+            }
+        }
+    }
+    barrier();
+
+    if (tid == 0) {
+        map[p.m_offset + CTL_EPOCH]    = epoch;
+        map[p.m_offset + CTL_HAND]     = int((uint(hand) + scanned) % S);
+        map[p.m_offset + CTL_MISSES]   = got;
+        map[p.m_offset + CTL_OVERFLOW] += s_ovf;
+        map[p.m_offset + CTL_TOT_MISS] += got;
+        map[p.m_offset + CTL_TOT_CALL] += 1;
+        map[p.m_offset + CTL_TOT_IDS]  += int(p.n_ids);
+    }
+}
+
+void copy() {
+    const uint k = gl_WorkGroupID.x;
+    if (int(k) >= map[p.m_offset + CTL_MISSES]) {
+        return;
+    }
+    const uint S   = p.n_slots;
+    const uint MB  = p.m_offset + 16 + p.n_cold + 3u * S;
+    const uint MS  = MB + S;
+    const uint src = p.h_offset + uint(map[MB + k]) * p.words;
+    const uint dst = p.d_offset + (p.p_blocks + p.t_blocks + uint(map[MS + k])) * p.words;
+    for (uint i = gl_LocalInvocationID.x; i < p.words; i += LOCAL) {
+        dev[dst + i] = host[src + i];
+    }
+}
+
+void main() {
+    if (MODE == 0) {
+        resolve();
+    } else {
+        copy();
+    }
+}

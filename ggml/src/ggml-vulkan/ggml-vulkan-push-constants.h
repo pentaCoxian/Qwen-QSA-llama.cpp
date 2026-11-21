@@ -539,6 +539,52 @@ struct vk_op_topk_radix_push_constants {
     uint32_t n_stream; // QSA only
 };
 
+// [vk-qsa-blk] block-sparse QSA attention (qsa_block_attn.comp)
+struct vk_op_qsa_block_attn_push_constants {
+    uint32_t n_head;
+    uint32_t n_wblk;
+    uint32_t n_split;
+    uint32_t k_type;
+    uint32_t v_type;
+    uint32_t q_offset; uint32_t q_nb1; uint32_t q_nb2;
+    uint32_t k_offset; uint32_t k_nb1; uint32_t k_nb2;
+    uint32_t v_offset; uint32_t v_nb1; uint32_t v_nb2;
+    uint32_t m_offset;
+    uint32_t i_offset;
+    uint32_t o_offset;
+    float    scale;
+    uint32_t sk_offset; // [kv-stream] scratch K/V for ids with bit 30 set
+    uint32_t sv_offset;
+    uint32_t tok_base;
+};
+
+// [qsa-score-reduce] qsa_score_reduce.comp
+struct vk_op_qsa_score_reduce_push_constants {
+    uint32_t n_blk;
+    uint32_t n_head;
+    uint32_t n_tok;
+    uint32_t s_offset;
+    uint32_t v_offset;
+    uint32_t v_stride;
+    uint32_t d_offset;
+};
+
+// [kv-stream] qsa_stream.comp
+struct vk_op_qsa_stream_push_constants {
+    uint32_t n_ids;
+    uint32_t p_blocks;
+    uint32_t t_blocks;
+    uint32_t n_slots;
+    uint32_t n_cold;
+    uint32_t n_blocks;
+    uint32_t i_offset;
+    uint32_t m_offset;
+    uint32_t r_offset;
+    uint32_t h_offset;
+    uint32_t d_offset;
+    uint32_t words;
+};
+
 struct vk_op_im2col_push_constants {
     uint64_t dst_addr;
     uint32_t batch_offset; uint32_t offset_delta;
